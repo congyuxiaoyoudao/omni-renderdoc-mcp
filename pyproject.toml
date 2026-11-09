@@ -1,0 +1,40 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "omni-renderdoc-mcp"
+version = "0.1.0"
+description = "Inspect RenderDoc captures and export frame meshes through MCP"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+dependencies = ["mcp>=1.20,<2"]
+
+[project.scripts]
+omni-renderdoc-mcp = "omni_renderdoc_mcp.cli:main"
+
+[tool.setuptools]
+packages = [
+    "omni_renderdoc_mcp",
+    "omni_renderdoc_mcp.bridge",
+    "omni_renderdoc_mcp.exporters",
+    "renderdoc_extension",
+    "renderdoc_extension.services",
+    "renderdoc_extension.utils",
+]
+package-dir = { omni_renderdoc_mcp = "mcp_server" }
+
+[tool.setuptools.package-data]
+"renderdoc_extension" = ["extension.json"]
+
+[tool.ruff]
+target-version = "py310"
+line-length = 79
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
