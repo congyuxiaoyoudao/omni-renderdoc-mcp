@@ -10,7 +10,12 @@ from ..utils.fbx import write_fbx
 from .mesh_formats import MeshError, enum_name
 from .mesh_inputs import check_input_bounds, input_attributes, input_indices
 from .mesh_outputs import post_mesh
-from .mesh_skin import bind_skin, captured_palette, has_skin_channels
+from .mesh_skin import (
+    bind_skin,
+    captured_palette,
+    has_skin_channels,
+    skinning_summary,
+)
 from .mesh_textures import MeshTextures
 from .mesh_topology import compact, faces
 
@@ -194,6 +199,11 @@ def _skin(spec, attrs, ids, stage):
         if isinstance(spec, dict) and "bones" in spec:
             skeleton = bind_skin(spec, attrs, ids)
             skin = "bound"
+            provenance = {
+                "hierarchy": "supplied skeleton",
+                "bind_matrices": "supplied global bind matrices",
+                "names": "supplied bone names",
+            }
         else:
             skeleton, provenance = captured_palette(spec, attrs, len(ids))
             skin = "captured_joint_palette"
@@ -204,6 +214,13 @@ def _skin(spec, attrs, ids, stage):
             provenance = {"reason": str(error)}
         else:
             skin = "captured_joint_palette"
+    elif skin == "channels_only":
+        provenance = {
+            "reason": (
+                "Post-transform positions cannot be used as original bind "
+                "geometry; provide position_attributes to select VS inputs"
+            )
+        }
     return skeleton, skin, provenance
 
 
@@ -479,6 +496,7 @@ def export_frame_meshes(
         "draw_count": len(matched),
         "exported_count": len(exported),
         "skipped_count": len(skipped),
+        "skinning": skinning_summary(exported + patch_inputs),
     }
     summary["patch_input_count"] = len(patch_inputs)
     if source_capture:

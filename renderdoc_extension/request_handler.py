@@ -7,6 +7,7 @@ def execute(ctx, method, params):
     if method not in (
         "export_frame_meshes",
         "stage_pass_shaders",
+        "stage_blender_scene",
     ):
         return dispatch(ctx, method, params)
     if not ctx.IsCaptureLoaded():
@@ -17,6 +18,28 @@ def execute(ctx, method, params):
     source_capture = ctx.GetCaptureFilename()
 
     def export(controller):
+        if method == "stage_blender_scene":
+            from .services.blender_export import export_blender_scene
+
+            options = dict(params, source_capture=source_capture)
+            pass_id = options.pop("pass_event_id", None)
+            if pass_id is not None:
+                import renderdoc as rd
+
+                from .services.shader_export import select_pass
+
+                if options.get("event_ids") is not None:
+                    raise ValueError(
+                        "Choose either pass_event_id or event_ids"
+                    )
+                _, actions = select_pass(controller, pass_id)
+                draw = rd.ActionFlags.Drawcall | rd.ActionFlags.MeshDispatch
+                options["event_ids"] = [
+                    a.eventId for a in actions if a.flags & draw
+                ]
+            return export_blender_scene(
+                controller, **options
+            )
         if method == "stage_pass_shaders":
             from .services.shader_export import stage_pass_shaders
 

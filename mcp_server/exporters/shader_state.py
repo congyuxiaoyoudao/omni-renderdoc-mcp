@@ -69,6 +69,13 @@ def _blend(blend: dict, target: int) -> tuple[list[str], list[str]]:
 
 def shaderlab_state(pipeline: dict) -> tuple[list[str], list[str]]:
     lines, notes = [], []
+    bias = pipeline.get("depth_bias", {})
+    if bias.get("enabled") and any(
+        bias.get(k, 0) != 0 for k in ("constant", "slope")
+    ):
+        notes.append(
+            "Native depth bias requires a verified ShaderLab offset adapter"
+        )
     cull = {"NoCull": "Off", "Back": "Back", "Front": "Front"}.get(
         pipeline.get("cull_mode")
     )

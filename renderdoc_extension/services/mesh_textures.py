@@ -68,12 +68,17 @@ def _binding_info(used, reflection, stage, shader):
     }
 
 
-def _write_bindings(pipeline, rd):
+def _write_bindings(pipeline, rd, stages=None):
     targets = list(pipeline.GetOutputTargets()) + [pipeline.GetDepthTarget()]
     targets.extend(
         item.descriptor
         for item in pipeline.GetAllUsedDescriptors()
         if enum_name(item.access.type) == "ReadWriteImage"
+        and (
+            stages is None
+            or not hasattr(item.access, "stage")
+            or item.access.stage in stages
+        )
     )
     writable = {}
     for view in targets:
@@ -222,11 +227,15 @@ class MeshTextures:
     def capture(self, pipeline):
         """Share an event's views and deduplicate saved pixels across draws."""
         result = []
-        writable = _write_bindings(pipeline, self.rd)
         cache = {}
         stages = ("Vertex", "Hull", "Domain", "Geometry", "Pixel")
         if pipeline.IsCaptureVK() or pipeline.IsCaptureD3D12():
             stages += ("Task", "Mesh")
+        writable = _write_bindings(
+            pipeline,
+            self.rd,
+            tuple(getattr(self.rd.ShaderStage, name) for name in stages),
+        )
         for name in stages:
             stage = getattr(self.rd.ShaderStage, name)
             shader = pipeline.GetShader(stage)

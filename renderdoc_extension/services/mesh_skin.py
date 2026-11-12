@@ -3,7 +3,7 @@
 import math
 import re
 
-from ..utils.fbx_transform import IDENTITY
+from ..utils.fbx_transform import IDENTITY, affine, inverse
 from .mesh_formats import MeshError
 
 
@@ -63,17 +63,32 @@ def _from_channels(spec, attributes, count):
     for joints, weights in pairs:
         if any(not names[n].get("decoded", True) for n in (joints, weights)):
             raise MeshError("Undecoded skin attribute format")
+        if any(
+            not isinstance(names[n].get("values"), (list, tuple))
+            or len(names[n]["values"]) != count
+            for n in (joints, weights)
+        ):
+            raise MeshError("Skin channel length does not match vertex count")
         for out, indices, amounts in zip(
             influences, names[joints]["values"], names[weights]["values"]
         ):
-            if len(indices) != len(amounts):
+            if (
+                not isinstance(indices, (list, tuple))
+                or not isinstance(amounts, (list, tuple))
+                or len(indices) != len(amounts)
+            ):
                 raise MeshError("Joint and weight components do not match")
             for index, weight in zip(indices, amounts):
-                if not math.isfinite(weight) or weight < 0:
+                if (
+                    type(weight) not in (int, float)
+                    or not math.isfinite(weight)
+                    or weight < 0
+                ):
                     raise MeshError("Invalid captured skin weight")
                 if weight:
                     if (
-                        not math.isfinite(index)
+                        type(index) not in (int, float)
+                        or not math.isfinite(index)
                         or index < 0
                         or index != int(index)
                     ):
@@ -155,6 +170,23 @@ def bind_skin(spec, attributes, source_ids):
         for m in matrices
     ):
         raise MeshError("Bind matrices require 16 finite numbers")
+    names = [bone["name"] for bone in spec["bones"]]
+    if any(not name for name in names) or len(set(names)) != len(names):
+        raise MeshError("Bone names must be nonempty and unique")
+    parents = [bone["parent"] for bone in spec["bones"]]
+    for index in range(len(parents)):
+        seen = set()
+        node = index
+        while node != -1:
+            if not 0 <= node < len(parents) or node in seen:
+                raise MeshError("Invalid bone parent or cyclic hierarchy")
+            seen.add(node)
+            node = parents[node]
+    try:
+        for matrix in matrices:
+            inverse(affine(matrix))
+    except ValueError as error:
+        raise MeshError(str(error))
     if "influences" in spec:
         table = spec["influences"]
         if isinstance(table, dict):
@@ -185,3 +217,36 @@ def bind_skin(spec, attributes, source_ids):
     if "mesh_bind_matrix" in spec:
         result["mesh_bind_matrix"] = spec["mesh_bind_matrix"]
     return result
+
+
+def skinning_summary(records):
+    """Distinguish supplied bind rigs from observed weight palettes."""
+    counts = {
+        status: sum(record.get("skin", "none") == status for record in records)
+        for status in (
+            "bound",
+            "captured_joint_palette",
+            "channels_only",
+            "unavailable",
+            "none",
+        )
+    }
+    limitations = []
+    if counts["captured_joint_palette"]:
+        limitations.append(
+            "Joint palettes preserve captured weights and joint IDs; bone "
+            "names, hierarchy and identity bind matrices are placeholders."
+        )
+    if counts["channels_only"] or counts["unavailable"]:
+        limitations.append(
+            "Some input skinning could not be bound; per-mesh provenance "
+            "records the missing inputs."
+        )
+    return {
+        "bound_skeleton_count": counts["bound"],
+        "captured_joint_palette_count": counts["captured_joint_palette"],
+        "channels_only_count": counts["channels_only"],
+        "unavailable_count": counts["unavailable"],
+        "unskinned_count": counts["none"],
+        "limitations": limitations,
+    }

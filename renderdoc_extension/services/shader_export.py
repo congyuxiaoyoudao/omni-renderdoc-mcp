@@ -350,6 +350,18 @@ def _graphics(controller, pipe):
         "viewports": [],
         "scissors": [],
     }
+    if getattr(pipe, "IsCaptureVK", lambda: False)():
+        native = controller.GetVulkanPipelineState().rasterizer
+        state["depth_bias"] = {
+            "enabled": native.depthBiasEnable,
+            "constant": finite_value(native.depthBias),
+            "slope": finite_value(native.slopeScaledDepthBias),
+            "clamp": finite_value(native.depthBiasClamp),
+            "exact": getattr(native, "depthBiasExact", None),
+            "representation": enum_name(native.depthBiasRepresentation)
+            if hasattr(native, "depthBiasRepresentation")
+            else None,
+        }
     for index, v in enumerate(viewports(controller, pipe)):
         state["viewports"].append(
             {

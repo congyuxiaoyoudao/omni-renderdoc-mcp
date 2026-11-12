@@ -19,6 +19,7 @@ packages = [
     "omni_renderdoc_mcp",
     "omni_renderdoc_mcp.bridge",
     "omni_renderdoc_mcp.exporters",
+    "omni_renderdoc_mcp.unity_templates",
     "renderdoc_extension",
     "renderdoc_extension.services",
     "renderdoc_extension.utils",
@@ -27,6 +28,7 @@ package-dir = { omni_renderdoc_mcp = "mcp_server" }
 
 [tool.setuptools.package-data]
 "renderdoc_extension" = ["extension.json"]
+"omni_renderdoc_mcp.unity_templates" = ["*.cs", "*.shader"]
 
 [tool.ruff]
 target-version = "py310"
