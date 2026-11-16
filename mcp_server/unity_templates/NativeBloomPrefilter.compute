@@ -1,0 +1,59 @@
+// Source-derived Bloom kernel: original arithmetic, taps and half-packed shared memory.
+#pragma kernel main
+#pragma target 5.0
+float4 _OutputSize;
+float4 _SourceSize;
+float4 _SourceExposure;
+float4 _Threshold;
+static const float3 _86[13] = { float3(0.0f, 0.0f, 4.0f), float3(-2.0f, -2.0f, 1.0f), float3(2.0f, -2.0f, 1.0f), float3(2.0f, 2.0f, 1.0f), float3(-2.0f, 2.0f, 1.0f), float3(-2.0f, 0.0f, 2.0f), float3(2.0f, 0.0f, 2.0f), float3(0.0f, 2.0f, 2.0f), float3(0.0f, -2.0f, 2.0f), float3(-1.0f, 1.0f, 4.0f), float3(1.0f, 1.0f, 4.0f), float3(-1.0f, -1.0f, 4.0f), float3(-1.0f, 1.0f, 4.0f) };
+
+
+
+
+
+SamplerState sampler_Linear_Clamp;
+Texture2D<float4> _Source;
+RWTexture2D<float3> _Output;
+
+static uint3 gl_GlobalInvocationID;
+struct SPIRV_Cross_Input
+{
+    uint3 gl_GlobalInvocationID : SV_DispatchThreadID;
+};
+
+void comp_main()
+{
+    float2 _92 = float2(gl_GlobalInvocationID.xy);
+    float2 _97 = (_92 + 0.5f.xx) * _OutputSize.zw;
+    float _100;
+    float3 _103;
+    _100 = 0.0f;
+    _103 = 0.0f.xxx;
+    float _89[13];
+    [loop]
+    for (int _105 = 0; _105 < 13; )
+    {
+        float3 _122 = _Source.SampleLevel(sampler_Linear_Clamp, _97 + (_86[_105].xy * _SourceSize.zw), 0.0f).xyz;
+        uint3 _123 = asuint(_122);
+        bool3 _124 = bool3(_123.x < uint3(2139095040u, 2139095040u, 2139095040u).x, _123.y < uint3(2139095040u, 2139095040u, 2139095040u).y, _123.z < uint3(2139095040u, 2139095040u, 2139095040u).z);
+        float3 _125 = float3(_124.x ? _122.x : 0.0f.xxx.x, _124.y ? _122.y : 0.0f.xxx.y, _124.z ? _122.z : 0.0f.xxx.z);
+        float _134 = max(max(_125.x, _125.y), _125.z);
+        float _138 = clamp(_134 - _Threshold.y, 0.0f, _Threshold.z);
+        float3 _149 = (_125 * (max((_Threshold.w * _138) * _138, _134 - _Threshold.x) / max(_134, 9.9999997473787516355514526367188e-05f))) * _SourceExposure.x;
+        _89[_105] = 1.0f / (dot(_149, float3(0.21267290413379669189453125f, 0.715152204036712646484375f, 0.072175003588199615478515625f)) + 1.0f);
+        _100 += (_86[_105].z * _89[_105]);
+        _103 += ((_149 * _86[_105].z) * _89[_105]);
+        _105++;
+        continue;
+    }
+    uint2 _164 = uint2(_OutputSize.xy);
+    if (all(gl_GlobalInvocationID.xy < uint2(_OutputSize.xy)))
+        _Output[uint2(_92)] = (_103 / _100.xxx) * float(all(bool2(gl_GlobalInvocationID.xy.x <= _164.x, gl_GlobalInvocationID.xy.y <= _164.y)));
+}
+
+[numthreads(8, 8, 1)]
+void main(SPIRV_Cross_Input stage_input)
+{
+    gl_GlobalInvocationID = stage_input.gl_GlobalInvocationID;
+    comp_main();
+}

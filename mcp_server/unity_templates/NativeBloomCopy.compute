@@ -1,0 +1,27 @@
+#pragma kernel Copy2D SOURCE_2D
+#pragma kernel CopyArray SOURCE_ARRAY
+#pragma target 5.0
+#if defined(SOURCE_2D)
+Texture2D<float4> _Source;
+#else
+Texture2DArray<float4> _Source;
+#endif
+RWTexture2D<float4> _Output;
+float4 _OutputSize;
+float _InputScale;
+[numthreads(8,8,1)]
+void Copy2D(uint3 id:SV_DispatchThreadID)
+{
+    if(any(id.xy>=uint2(_OutputSize.xy)))return;
+    #if defined(SOURCE_2D)
+    _Output[id.xy]=float4(_Source.Load(int3(id.xy,0)).rgb*_InputScale,1);
+    #endif
+}
+[numthreads(8,8,1)]
+void CopyArray(uint3 id:SV_DispatchThreadID)
+{
+    if(any(id.xy>=uint2(_OutputSize.xy)))return;
+    #if defined(SOURCE_ARRAY)
+    _Output[id.xy]=float4(_Source.Load(int4(id.xy,0,0)).rgb*_InputScale,1);
+    #endif
+}

@@ -59,6 +59,7 @@ claude mcp add --transport stdio --scope user omni-renderdoc-mcp -- $server serv
 | 查找绘制 | `find_draws_by_shader`、`find_draws_by_texture`、`find_draws_by_resource` |
 | 资源与管线 | `get_buffer_contents`、`get_texture_info`、`get_texture_data`、`get_shader_info`、`get_pipeline_state` |
 | 导出 | `export_frame_meshes`、`export_pass_shaders`、`export_blender_scene`、`export_unity_hdrp` |
+| 还原分析 | `get_resource_dependencies`、`export_texture_snapshot`、`audit_unity_restoration`、`compare_render_outputs` |
 
 ## 使用方式
 
@@ -78,7 +79,7 @@ claude mcp add --transport stdio --scope user omni-renderdoc-mcp -- $server serv
 
 ### Unity HDRP 工程导出
 
-通过 `export_unity_hdrp` 将选定 draw/pass 导出为 Unity HDRP 工程，并调用本机 Unity 生成场景和预览。默认使用 HDRP/Lit 近似材质；设置 `shader_mode: "original_fragment"` 并提供 SPIRV-Cross，可转换原始 Vulkan 片元着色器，在 Windows/D3D11 下重放捕获画面。
+通过 `export_unity_hdrp` 将选定 draw/pass 导出为 Unity HDRP 工程，生成普通 MeshRenderer 驱动的 `CaptureScene`，支持修改顶点、拓扑、UV、材质和实时光照。默认使用 HDRP/Lit；设置 `shader_mode: "original_fragment"` 并提供 SPIRV-Cross，还会生成保留原始片元着色器的 `RecoveredCaptureScene` 作为外观对照。
 
 ## 许可证
 

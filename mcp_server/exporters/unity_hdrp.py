@@ -305,10 +305,15 @@ def prepare_project(
     scripts.mkdir(parents=True, exist_ok=True)
     shutil.copy2(template / "CapturedProjection.cs", scripts)
     # Templates may include support shaders in later exporter versions.
+    support_shaders = []
     for shader in template.glob("*.shader"):
         destination = project / "Assets/Capture/Shaders" / shader.name
         destination.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(shader, destination)
+        support_shaders.append(destination.relative_to(project))
+    from .native_picking import adapt_project_native_picking
+
+    adapt_project_native_picking(project, support_shaders)
     _write_json(
         project / "Packages/manifest.json",
         {
@@ -510,6 +515,27 @@ def _verify_original(project, render_preview, expected_meshes):
     scene = project / "Assets/RecoveredCaptureScene.unity"
     if not scene.is_file() or not scene.stat().st_size:
         raise RuntimeError("Unity produced no saved recovered scene")
+    if report.get("editable_scene"):
+        editable = project / "Assets/CaptureScene.unity"
+        if not editable.is_file() or not editable.stat().st_size:
+            raise RuntimeError("Unity produced no saved editable scene")
+        native_report_path = project / "native-result.json"
+        if not native_report_path.is_file():
+            raise RuntimeError("Unity produced no native editable result")
+        native_report = _read_json(native_report_path)
+        if (
+            native_report.get("status") != "complete"
+            or native_report.get("appearance_mode") != "editable_meshes_hdrp"
+            or native_report.get("mesh_count", 0) <= 0
+        ):
+            raise RuntimeError("Native editable scene failed validation")
+        if render_preview:
+            native_preview = project / "native-preview.png"
+            if (
+                not native_preview.is_file()
+                or native_preview.read_bytes()[:8] != b"\x89PNG\r\n\x1a\n"
+            ):
+                raise RuntimeError("Unity produced no native editable preview")
     if render_preview:
         preview = project / "recovered-preview.png"
         if (
@@ -660,6 +686,7 @@ async def export_unity_hdrp(
                 **(
                     {
                         "include_shader_evidence": True,
+                        "stage_editable_materials": True,
                         "shader_evidence_options": {
                             "native_only": True,
                             "decode_constants": False,
@@ -753,8 +780,11 @@ async def export_unity_hdrp(
             scene=str(
                 project
                 / (
-                    "Assets/RecoveredCaptureScene.unity"
-                    if original
+                    (
+                        "Assets/CaptureScene.unity"
+                        if report.get("editable_scene")
+                        else "Assets/RecoveredCaptureScene.unity"
+                    ) if original
                     else "Assets/CaptureScene.unity"
                 )
             ),
@@ -768,9 +798,16 @@ async def export_unity_hdrp(
             ),
         )
         if render_preview:
-            result["preview"] = str(
-                project
-                / ("recovered-preview.png" if original else "preview.png")
-            )
+            preview_name = "preview.png"
+            if original:
+                preview_name = (
+                    "native-preview.png" if report.get("editable_scene")
+                    else "recovered-preview.png"
+                )
+            result["preview"] = str(project / preview_name)
+            if original and report.get("editable_scene"):
+                result["reference_preview"] = str(
+                    project / "recovered-preview.png"
+                )
         _write_json(project / "export_result.json", result)
     return result

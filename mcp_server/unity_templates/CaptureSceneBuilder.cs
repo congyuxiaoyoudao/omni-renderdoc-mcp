@@ -351,12 +351,10 @@ namespace OmniRenderDoc
             if (lighting?.background_color_linear != null)
                 result.warnings.Add("Background is a caller-supplied flat clear color approximation, not a recovered sky or fog shader.");
             data.antialiasing = HDAdditionalCameraData.AntialiasingMode.None;
-            var projection = obj.AddComponent<CapturedProjection>();
-            projection.p00 = spec.p00;
-            projection.p11 = spec.p11;
-            projection.width = spec.width;
-            projection.height = spec.height;
-            projection.Apply();
+            // An editable scene uses ordinary serialized camera settings.
+            // Do not restore the capture's FOV/aspect every LateUpdate.
+            camera.fieldOfView = 2f * Mathf.Atan(1f / spec.p11) * Mathf.Rad2Deg;
+            camera.ResetProjectionMatrix();
             return camera;
         }
 

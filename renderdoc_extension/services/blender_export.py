@@ -17,6 +17,7 @@ from .mesh import _lookup
 from .mesh_formats import MeshError, enum_name
 from .mesh_outputs import post_mesh
 from .mesh_skin import skinning_summary
+from .mesh_sources import capture_vertex_source
 from .mesh_textures import MeshTextures, _binding_info, _write_bindings
 
 
@@ -379,6 +380,7 @@ def export_blender_scene(
     skeletons=None,
     position_attributes=None,
     shader_evidence_options=None,
+    stage_editable_materials=False,
 ):
     """Export a scene on the replay thread; caller restores the event.
 
@@ -415,6 +417,8 @@ def export_blender_scene(
         raise ValueError("position_attributes values must be attribute names")
     if type(include_shader_evidence) is not bool:
         raise ValueError("include_shader_evidence must be boolean")
+    if type(stage_editable_materials) is not bool:
+        raise ValueError("stage_editable_materials must be boolean")
     if shader_evidence_limits is not None and not include_shader_evidence:
         raise ValueError("shader_evidence_limits require shader evidence")
     if shader_evidence_options is not None and not include_shader_evidence:
@@ -507,7 +511,7 @@ def export_blender_scene(
         count = max(1, action.numInstances)
         for instance in range(count):
             try:
-                position, attrs, faces, _, topology = post_mesh(
+                position, attrs, faces, post_rows, topology = post_mesh(
                     controller, rd, pipeline, action, instance, stage
                 )
                 geometry = _geometry(
@@ -520,6 +524,11 @@ def export_blender_scene(
                 )
                 if include_shader_evidence:
                     _varying_metadata(rd, pipeline, stage, geometry)
+                    geometry["source_geometry"] = capture_vertex_source(
+                        controller, rd, pipeline, action, instance, stage,
+                        post_rows, geometry["source_vertex_indices"],
+                        _lookup(position_attributes or {}, eid, instance),
+                    )
                 digest = hashlib.sha256(
                     json.dumps(
                         [geometry["positions"], geometry["faces"]],
@@ -527,13 +536,25 @@ def export_blender_scene(
                     ).encode("utf-8")
                 ).hexdigest()
                 if material is None:
-                    if native_only:
+                    override = (material_bindings or {}).get(str(eid), {})
+                    explicit_roles = any(
+                        role in override for role in ("base_color", "normal")
+                    )
+                    if (native_only and not stage_editable_materials
+                            and not explicit_roles):
                         material = {"mode": "native_shader_evidence"}
                     else:
-                        material = images.material(
-                            pipeline,
-                            (material_bindings or {}).get(str(eid), {}),
-                        )
+                        material = images.material(pipeline, override)
+                        if native_only:
+                            material["mode"] = (
+                                "editable_material_approximation"
+                            )
+                            material["provenance"] = (
+                                "Editable material preview only; texture "
+                                "roles use explicit bindings or the recorded "
+                                "name/format/size heuristic. Original shader "
+                                "evidence remains native and independent."
+                            )
                 name = "event_{:08d}_instance_{:04d}".format(eid, instance)
                 geometry.update(
                     name=name,

@@ -64,6 +64,7 @@ namespace OmniRenderDoc
             public int preview_width, preview_height;
             public bool clear_color = true, isolated_depth = true;
             public bool render_preview = true;
+            public bool build_editable_scene;
             public DrawSpec[] draws;
             public TargetSpec[] render_targets;
             public string final_target;
@@ -77,6 +78,8 @@ namespace OmniRenderDoc
         {
             public string status, error, scene = "Assets/RecoveredCaptureScene.unity", preview = "recovered-preview.png";
             public string appearance_mode = "original_fragment_equations";
+            public string editable_scene;
+            public List<string> warnings = new List<string>();
             public int draw_count, shader_count, texture_count;
             public List<string> storage_conversions = new List<string>();
             public List<string> diagnostic_previews = new List<string>();
@@ -241,6 +244,13 @@ namespace OmniRenderDoc
                         }
                         finally { runtime.finalTarget = manifest.final_target; runtime.finalIsSrgb = manifest.final_is_srgb; runtime.finalFlipY = manifest.final_flip_y; }
                     }
+                }
+                if (manifest.build_editable_scene)
+                {
+                    var native = NativeCaptureSceneBuilder.BuildScene();
+                    if (native.status != "complete") throw new InvalidOperationException("Native editable scene failed: " + native.error);
+                    result.editable_scene = native.scene;
+                    result.warnings.AddRange(native.warnings);
                 }
                 result.status = "complete";
                 File.WriteAllText(Path.Combine(Root, "recovered-result.json"), JsonUtility.ToJson(result, true));

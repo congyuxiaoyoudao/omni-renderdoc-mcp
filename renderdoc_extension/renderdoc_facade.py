@@ -3,7 +3,7 @@
 from functools import partial
 
 from .services import action_service as actions
-from .services import capture_manager
+from .services import capture_manager, resource_dependencies, texture_snapshot
 from .services import pipeline_service as pipeline
 from .services import resource_service as resources
 from .services import search_service as search
@@ -50,6 +50,8 @@ REPLAY_TOOLS = {
         search.find_draws_by_resource,
         search.find_draws_by_shader,
         search.find_draws_by_texture,
+        texture_snapshot.export_texture_snapshot,
+        resource_dependencies.get_resource_dependencies,
     )
 }
 
@@ -57,9 +59,12 @@ NAMED_RESOURCES = {
     "find_draws_by_shader",
     "find_draws_by_texture",
     "get_pipeline_state",
+    "get_resource_dependencies",
 }
 
-SELECT_EVENT = NAMED_RESOURCES | {"find_draws_by_resource", "get_shader_info"}
+SELECT_EVENT = NAMED_RESOURCES | {
+    "find_draws_by_resource", "get_shader_info", "export_texture_snapshot",
+}
 
 
 def dispatch(ctx, method, params):
@@ -74,12 +79,17 @@ def dispatch(ctx, method, params):
     handler = REPLAY_TOOLS[method]
     if not ctx.IsCaptureLoaded():
         raise ValueError("No capture loaded")
+    if method == "export_texture_snapshot":
+        handler = partial(handler, source_capture=ctx.GetCaptureFilename())
     if method in NAMED_RESOURCES:
         names = {
             str(r.resourceId): ctx.GetResourceName(r.resourceId)
             for r in ctx.GetResources()
         }
         handler = partial(handler, names=names)
-    return replay(
+    result = replay(
         ctx, partial(handler, **params), restore_event=method in SELECT_EVENT
     )
+    if method == "get_resource_dependencies":
+        result["capture_path"] = ctx.GetCaptureFilename()
+    return result

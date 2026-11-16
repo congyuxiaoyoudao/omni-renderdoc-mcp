@@ -247,6 +247,140 @@ def _resource_name(resource, prefix):
     )
 
 
+def _editable_mesh_displacement(shader):
+    """Also upgrade the first editable wrapper without retranslating PS."""
+    old = "float3 CapturedEditVarying(float3 value, int location)"
+    new = (
+        "float3 CapturedEditVarying(float3 value, int location, "
+        "float3 meshDisplacement)"
+    )
+    if new in shader:
+        return shader
+    if old not in shader:
+        raise ValueError("Unknown editable varying wrapper")
+    shader = shader.replace(old, new, 1)
+    shader = shader.replace(
+        "float4x4 _CapturedVaryingNormalTransform;",
+        "float4x4 _CapturedVaryingNormalTransform;\n"
+        "float4x4 _CapturedMeshDisplacementToShading;",
+        1,
+    )
+    shader = shader.replace(
+        "return mul(_CapturedVaryingTransform, float4(value, 1.0)).xyz;",
+        "return mul(_CapturedVaryingTransform, float4(value, 1.0)).xyz\n"
+        "            + mul(_CapturedMeshDisplacementToShading, "
+        "float4(meshDisplacement, 0.0)).xyz;",
+        1,
+    )
+    return re.sub(
+        r"(CapturedEditVarying\(result\.\w+\.xyz, \d+)\);",
+        r"\1, meshPosition - _CapturedReferencePositions[vertexID].xyz);",
+        shader,
+    )
+
+
+def enable_editable_vertex(shader, input_attributes):
+    """Upgrade a captured wrapper without changing its original PS source.
+
+    Location roles are opt-in runtime metadata, never inferred from an event
+    ID or an anonymous TEXCOORD number. Both clip matrices use the original
+    clip space before the existing clip-Y conversion.
+    """
+    shader = shader.replace("\r\n", "\n")
+    if "float3 CapturedEditVarying(" in shader:
+        return _editable_mesh_displacement(shader)
+    vertex = re.search(
+        r"CapturedRaster CapturedVertex\(uint vertexID : SV_VertexID\)"
+        r"\s*\{(?P<body>.*?)\n\}",
+        shader,
+        re.S,
+    )
+    if vertex is None:
+        raise ValueError("Missing supported captured vertex wrapper")
+    body = vertex["body"]
+    clip_assignment = "    result.position = _CapturedClipPositions[vertexID];"
+    if body.count(clip_assignment) != 1:
+        raise ValueError("Cannot locate captured clip-position assignment")
+    body = body.replace(
+        clip_assignment,
+        clip_assignment
+        + """
+    if (_CapturedEditEnabled > 0.5)
+    {
+        result.position += mul(_CapturedEditObjectToClip,
+            float4(meshPosition, 1.0)) - mul(_CapturedReferenceObjectToClip,
+            _CapturedReferencePositions[vertexID]);
+    }""",
+    )
+    for field in input_attributes:
+        if field["scalar_type"] != "float" or field["components"] < 3:
+            continue
+        name, location = field["name"], field["location"]
+        assignment = re.compile(
+            r"(?m)^    result\." + re.escape(name) + r" = [^\n]+;"
+        )
+        if len(assignment.findall(body)) != 1:
+            raise ValueError("Cannot locate captured varying " + name)
+        adapter = [
+            "    if (_CapturedEditEnabled > 0.5)",
+            "    {",
+            f"        result.{name}.xyz = CapturedEditVarying("
+            f"result.{name}.xyz, {location});",
+        ]
+        if field["components"] == 4:
+            adapter.append(
+                f"        if (_CapturedTangentVarying == {location}) "
+                f"result.{name}.w *= determinant((float3x3)"
+                "_CapturedVaryingTransform) < 0.0 ? -1.0 : 1.0;"
+            )
+        adapter.append("    }")
+        body = assignment.sub(lambda m: m[0] + "\n" + "\n".join(adapter), body)
+    replacement = (
+        "CapturedRaster CapturedVertex(uint vertexID : SV_VertexID,\n"
+        "    float3 meshPosition : POSITION)\n{" + body + "\n}"
+    )
+    shader = shader[: vertex.start()] + replacement + shader[vertex.end() :]
+    declarations = """
+StructuredBuffer<float4> _CapturedReferencePositions;
+float _CapturedEditEnabled;
+float4x4 _CapturedEditObjectToClip;
+float4x4 _CapturedReferenceObjectToClip;
+int _CapturedPositionVarying;
+int _CapturedNormalVarying;
+int _CapturedTangentVarying;
+float4x4 _CapturedVaryingTransform;
+float4x4 _CapturedVaryingNormalTransform;
+float3 CapturedEditVarying(float3 value, int location)
+{
+    if (_CapturedPositionVarying == location)
+        return mul(_CapturedVaryingTransform, float4(value, 1.0)).xyz;
+    if (_CapturedNormalVarying == location)
+        return mul((float3x3)_CapturedVaryingNormalTransform, value);
+    if (_CapturedTangentVarying == location)
+        return mul((float3x3)_CapturedVaryingTransform, value);
+    return value;
+}
+"""
+    shader = shader.replace(
+        "struct CapturedRaster\n", declarations + "struct CapturedRaster\n", 1
+    )
+    properties = [
+        '_CapturedEditEnabled ("Use editable mesh transforms", Float) = 0',
+        '_CapturedPositionVarying ("Position varying location", Integer) = -1',
+        '_CapturedNormalVarying ("Normal varying location", Integer) = -1',
+        '_CapturedTangentVarying ("Tangent varying location", Integer) = -1',
+    ]
+    if "Properties {\n" not in shader:
+        raise ValueError("Missing captured shader Properties block")
+    return _editable_mesh_displacement(
+        shader.replace(
+            "Properties {\n",
+            "Properties {\n" + "\n".join(properties) + "\n",
+            1,
+        )
+    )
+
+
 def compile_fragment(
     spirv,
     destination,
@@ -473,6 +607,7 @@ def compile_fragment(
 
     raster_fields = ["    float4 position : SV_POSITION;"]
     assignments = []
+    editable_varyings = []
     for field in varyings:
         raster_fields.append(
             "    {qualifier}{type} {name} : {semantic};".format(**field)
@@ -488,6 +623,14 @@ def compile_fragment(
         value = (conversion + "(" + bits + ")") if conversion else bits
         value += "." + "xyzw"[: field["components"]]
         assignments.append("    result.{} = {};".format(field["name"], value))
+        if field["scalar_type"] == "float" and field["components"] >= 3:
+            editable_varyings.append(
+                {
+                    "location": field["location"],
+                    "type": field["type"],
+                    "name": field["name"],
+                }
+            )
     fragment_assignments = []
     for field in inputs:
         semantic = field["semantic"].upper()
@@ -661,6 +804,7 @@ FRAGMENT_RETURN
             "}",
         ]
     )
+    shader = enable_editable_vertex(shader, varyings)
     destination.write_text(shader, encoding="utf-8")
     return {
         "event_id": event_id,
@@ -680,6 +824,7 @@ FRAGMENT_RETURN
         "early_depth_stencil": early_depth,
         "unity_reversed_z": unity_reversed_z,
         "swizzle_adapters": swizzle_adapters,
+        "editable_varying_locations": editable_varyings,
     }
 
 

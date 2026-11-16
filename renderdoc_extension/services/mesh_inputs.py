@@ -209,12 +209,67 @@ def _generic_attribute(attr, count):
     }
 
 
+def _input_metadata(attr, bound, signature, instance_element=None):
+    """Retain the input binding without assuming a vertex shader's math."""
+    result = {
+        "extraction_stage": "VSIn",
+        "coordinate_space": "vertex_input",
+        "vertex_buffer": attr.vertexBuffer,
+        "byte_offset": attr.byteOffset,
+        "per_instance": bool(attr.perInstance),
+        "instance_rate": attr.instanceRate,
+        "generic": bool(attr.genericEnabled),
+        "used": bool(attr.used),
+        "components": attr.format.compCount,
+        "component_type": enum_name(attr.format.compType),
+        "component_byte_width": attr.format.compByteWidth,
+        "element_byte_size": attr.format.ElementSize(),
+    }
+    if bound is not None:
+        result.update(
+            resource_id=str(bound.resourceId),
+            binding_byte_offset=bound.byteOffset,
+            binding_byte_size=bound.byteSize,
+            byte_stride=bound.byteStride,
+        )
+    if instance_element is not None:
+        result["instance_element"] = instance_element
+    if signature is not None:
+        for target, source in (
+            ("location", "regIndex"),
+            ("semantic", "semanticName"),
+            ("semantic_index", "semanticIndex"),
+            ("semantic_indexed", "semanticIdxName"),
+        ):
+            if hasattr(signature, source):
+                result[target] = getattr(signature, source)
+        if hasattr(signature, "systemValue"):
+            result["system_value"] = enum_name(signature.systemValue)
+        result["reflection_match"] = "input attribute name"
+    return result
+
+
 def input_attributes(controller, rd, pipeline, action, instance, source_ids):
     buffers = pipeline.GetVBuffers()
+    reflection = None
+    if hasattr(pipeline, "GetShaderReflection") and hasattr(rd, "ShaderStage"):
+        reflection = pipeline.GetShaderReflection(rd.ShaderStage.Vertex)
+    signatures = getattr(reflection, "inputSignature", [])
     attributes = []
     for attr in pipeline.GetVertexInputs():
+        matches = [
+            signature
+            for signature in signatures
+            if attr.name in (
+                getattr(signature, "varName", None),
+                getattr(signature, "semanticIdxName", None),
+            )
+        ]
+        signature = matches[0] if len(matches) == 1 else None
         if attr.genericEnabled:
-            attributes.append(_generic_attribute(attr, len(source_ids)))
+            entry = _generic_attribute(attr, len(source_ids))
+            entry.update(_input_metadata(attr, None, signature))
+            attributes.append(entry)
             continue
         slot = attr.vertexBuffer
         if (
@@ -228,16 +283,20 @@ def input_attributes(controller, rd, pipeline, action, instance, source_ids):
         if attr.perInstance:
             step = instance // attr.instanceRate if attr.instanceRate else 0
             rows = [action.instanceOffset + step] * len(source_ids)
+            instance_element = action.instanceOffset + step
         else:
             rows = source_ids
-        attributes.append(
-            read_attribute(
-                controller,
-                attr.name,
-                attr.format,
-                Binding.from_pipeline(buffers[slot]),
-                attr.byteOffset,
-                rows,
-            )
+            instance_element = None
+        entry = read_attribute(
+            controller,
+            attr.name,
+            attr.format,
+            Binding.from_pipeline(buffers[slot]),
+            attr.byteOffset,
+            rows,
         )
+        entry.update(_input_metadata(
+            attr, buffers[slot], signature, instance_element
+        ))
+        attributes.append(entry)
     return attributes

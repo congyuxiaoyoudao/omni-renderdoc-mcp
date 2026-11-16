@@ -1,5 +1,8 @@
 """The public MCP interface. RenderDoc itself runs in the GUI process."""
 
+import asyncio
+import json
+import tempfile
 from pathlib import Path
 from typing import Literal
 
@@ -155,6 +158,116 @@ def make_server(
     async def get_pipeline_state(event_id: int) -> dict[str, object]:
         """Inspect shaders, descriptors, attachments and viewports."""
         return await call("get_pipeline_state", event_id=event_id)
+
+    @server.tool()
+    async def get_resource_dependencies(
+        event_ids: list[int] | None = None,
+        pass_event_id: int | None = None,
+        max_events: int = 2048,
+        max_depth: int = 64,
+        output_directory: str | None = None,
+    ) -> dict[str, object]:
+        """Trace conservative upstream resource versions for selected events.
+
+        Choose event_ids OR pass_event_id. Include draw, dispatch, copy,
+        resolve and clear usage. Resource-level observations do not prove
+        subresource/byte-range causality; partial writes retain earlier
+        possible producers. Inspect limits and unresolved inputs.
+        With output_directory, save the full graph and return a summary.
+        """
+        result = await call(
+            "get_resource_dependencies", event_ids=event_ids,
+            pass_event_id=pass_event_id, max_events=max_events,
+            max_depth=max_depth,
+        )
+        if output_directory is None:
+            return result
+        root = Path(output_directory).expanduser().resolve()
+        root.mkdir(parents=True, exist_ok=True)
+        folder = Path(tempfile.mkdtemp(prefix="dependencies-", dir=root))
+        path = folder / "resource-dependencies.json"
+        path.write_text(
+            json.dumps(result, indent=2, allow_nan=False), encoding="utf-8"
+        )
+        return {
+            "schema": result.get("schema"), "report_path": str(path),
+            "summary": result.get("summary", {}),
+            "complete": result.get("complete"),
+            "scope": result.get("scope"),
+            "warnings": result.get("warnings", []),
+            "truncated": result.get("truncated"),
+            "exact": result.get("exact", False),
+            "complete_meaning": result.get("complete_meaning"),
+        }
+
+    @server.tool()
+    async def export_texture_snapshot(
+        event_id: int, resource_id: str, output_directory: str,
+        mip: int = 0, slice: int = 0, sample: int = 0,
+        depth_slice: int | None = None, max_bytes: int = 268435456,
+    ) -> dict[str, object]:
+        """Save an event-bound native texture subresource and hashed metadata.
+
+        Reads after event_id and restores the previous replay event. Does
+        not tonemap, recolor or flip data. Plain scalar formats expose a
+        descriptor for compare_render_outputs; packed/compressed/sRGB data
+        remains native and needs an explicit decoder before comparison.
+        """
+        return await call(
+            "export_texture_snapshot", event_id=event_id,
+            resource_id=resource_id, output_directory=output_directory,
+            mip=mip, slice=slice, sample=sample, depth_slice=depth_slice,
+            max_bytes=max_bytes,
+        )
+
+    @server.tool()
+    async def compare_render_outputs(
+        layers: list[dict], output_directory: str | None = None,
+    ) -> dict[str, object]:
+        """Compare raw outputs and locate divergent dependency boundaries.
+
+        Each layer: name, reference/rendered {path,width,height,channels,
+        encoding,flip_y?,sha256?}, tolerance {absolute,relative}, optional
+        roi [x,y,width,height], depends_on [layer names], identical_inputs.
+        Encodings: float32le, float16le, unorm8/16, snorm8/16. Optional
+        reference_before/rendered_before compare effect contributions.
+        No implicit resize or color conversion. Nonfinite values fail.
+        Differences are numerical observations, not automatic root causes.
+        """
+        from .analysis.render_comparison import compare_render_outputs
+
+        return await asyncio.to_thread(
+            compare_render_outputs, layers, output_directory
+        )
+
+    @server.tool()
+    async def audit_unity_restoration(
+        project_path: str,
+        dependency_graph_path: str | None = None,
+        profile_path: str | None = None,
+        output_directory: str | None = None,
+    ) -> dict[str, object]:
+        """Inventory a Unity export's restoration state without editing it.
+
+        Read manifests, material mappings and shader identities; report
+        frozen/partial inputs. Optional version-1 profile has modules with
+        id,status,reason,scope,event_ids,resource_ids, implementation_files
+        and evidence ({path,sha256}). Status: exact/adapted/frozen/missing/
+        unknown; changed file hashes invalidate evidence. Static claims do
+        not prove visual equivalence. Unknown semantics stay unknown.
+        """
+        from .analysis.restoration_audit import audit_unity_restoration
+
+        result = await asyncio.to_thread(
+            audit_unity_restoration, project_path, dependency_graph_path,
+            profile_path, output_directory,
+        )
+        if output_directory is None:
+            return result
+        return {key: result.get(key) for key in (
+            "schema", "report_path", "summary", "modules",
+            "dependency_graph", "limits", "visual_equivalence_verified",
+        )}
 
     @server.tool()
     async def export_pass_shaders(
@@ -373,6 +486,14 @@ def make_server(
         Earlier selected outputs are connected; omitted producers stay native
         capture snapshots. This mode currently targets Windows/D3D11. Native
         shaders run at captured resolution; render_scale controls the preview.
+        When a perspective projection can be verified, CaptureScene contains
+        independent Transform/MeshFilter/MeshRenderer objects with ordinary
+        editable topology, vertex channels and realtime HDRP materials.
+        RecoveredCaptureScene remains the original-fragment reference replay.
+        The editable scene does not render captured vertex buffers or frame
+        history. Its material/lighting fidelity depends on verified semantics;
+        unknown materials are approximations. Screen/UI replay stays in the
+        reference scene. Captured poses do not imply recovered rigs/animation.
         It cannot restore animation, original source code or omitted compute
         passes. Unsupported bindings/states fail instead of using HDRP/Lit.
         supplementary_buffers optionally supplies a captured raw-buffer index.

@@ -45,6 +45,8 @@ namespace OmniRenderDoc
             public int eventId, instance, varyingStride;
             public Mesh mesh;
             public Material material;
+            public EditableCapturedDraw editableObject;
+            public bool usesEditableObject;
             public TextAsset varyings, clipPositions;
             public float clipYSign = 1;
             public bool frontFaceFlip;
@@ -72,6 +74,10 @@ namespace OmniRenderDoc
         public bool finalIsSrgb;
         public bool finalFlipY;
         public Material finalCopyMaterial;
+        public bool editableGeometry;
+        public Matrix4x4 capturedProjection = Matrix4x4.identity;
+        public Matrix4x4 capturedCameraProjection = Matrix4x4.identity;
+        public Camera editingCamera;
         [NonSerialized] public string lastRenderError;
         [NonSerialized] bool ready;
 
@@ -86,6 +92,7 @@ namespace OmniRenderDoc
                     foreach (var buffer in draw.ownedBuffers) buffer?.Release();
                 draw.ownedBuffers = null;
                 draw.properties = null;
+                foreach (var binding in draw.rawBuffers) binding.gpuBuffer = null;
             }
             ready = false;
         }
@@ -101,15 +108,19 @@ namespace OmniRenderDoc
             var values = new uint[padded / 4];
             Buffer.BlockCopy(bytes, 0, values, 0, byteCount);
             var buffer = new ComputeBuffer(padded / stride, stride, type);
-            if (stride == 16)
+            try
             {
-                var rows = new UInt4[padded / 16];
-                for (int i = 0; i < rows.Length; i++)
-                    rows[i] = new UInt4 { x = values[i * 4], y = values[i * 4 + 1], z = values[i * 4 + 2], w = values[i * 4 + 3] };
-                buffer.SetData(rows);
+                if (stride == 16)
+                {
+                    var rows = new UInt4[padded / 16];
+                    for (int i = 0; i < rows.Length; i++)
+                        rows[i] = new UInt4 { x = values[i * 4], y = values[i * 4 + 1], z = values[i * 4 + 2], w = values[i * 4 + 3] };
+                    buffer.SetData(rows);
+                }
+                else buffer.SetData(values);
+                return buffer;
             }
-            else buffer.SetData(values);
-            return buffer;
+            catch { buffer.Release(); throw; }
         }
 
         public void Prepare()
@@ -124,12 +135,29 @@ namespace OmniRenderDoc
                 {
                     if (draw.mesh == null || draw.material == null)
                         throw new InvalidOperationException("Missing recovered mesh/material: " + draw.name);
+                    if (!draw.mesh.isReadable || draw.mesh.vertexCount <= 0)
+                        throw new InvalidOperationException("Captured reference mesh must be readable and nonempty: " + draw.name);
+                    if (draw.clipPositions == null || draw.clipPositions.bytes.LongLength != 16L * draw.mesh.vertexCount)
+                        throw new InvalidOperationException("Captured clip positions do not match the reference mesh: " + draw.name);
+                    if (draw.varyingStride < 0 || (draw.varyingStride > 0 &&
+                        (draw.varyings == null || draw.varyings.bytes.LongLength != 16L * draw.mesh.vertexCount * draw.varyingStride)))
+                        throw new InvalidOperationException("Captured varying data is missing or incomplete: " + draw.name);
                     draw.properties = new MaterialPropertyBlock();
                     draw.ownedBuffers = new List<ComputeBuffer>();
                     var clip = CreateBuffer(draw.clipPositions, 16, ComputeBufferType.Structured);
                     draw.ownedBuffers.Add(clip);
                     draw.properties.SetBuffer("_CapturedClipPositions", clip);
-                    if (draw.varyings != null && draw.varyingStride > 0)
+                    // D3D12 validates every reflected SRV even when a uniform
+                    // branch disables edits. Fixed UI/fullscreen draws and the
+                    // reference replay therefore need this binding as well.
+                    var vertices = draw.mesh.vertices;
+                    var positions = new Vector4[vertices.Length];
+                    for (int i = 0; i < vertices.Length; i++) positions[i] = new Vector4(vertices[i].x, vertices[i].y, vertices[i].z, 1);
+                    var reference = new ComputeBuffer(positions.Length, 16, ComputeBufferType.Structured);
+                    draw.ownedBuffers.Add(reference);
+                    reference.SetData(positions);
+                    draw.properties.SetBuffer("_CapturedReferencePositions", reference);
+                    if (draw.varyingStride > 0)
                     {
                         var varying = CreateBuffer(draw.varyings, 16, ComputeBufferType.Structured);
                         draw.ownedBuffers.Add(varying);
@@ -166,8 +194,54 @@ namespace OmniRenderDoc
         public CaptureFragmentRuntime source;
         RTHandle capturedDepth;
         RTHandle colorSnapshot;
+        RTHandle presentationColor;
         readonly Dictionary<string, RenderTexture> targets = new Dictionary<string, RenderTexture>();
-        int depthWidth, depthHeight;
+        RenderTextureDescriptor depthDescriptor;
+
+        void EnsureCapturedDepth(RTHandle cameraColor)
+        {
+            if (cameraColor == null || cameraColor.rt == null)
+                throw new InvalidOperationException("HDRP camera color texture is unavailable.");
+            // RTHandles can retain an allocation larger than this camera's
+            // viewport. Attachments must match the backing texture, including
+            // its samples, slices and dynamic-resolution settings.
+            var descriptor = cameraColor.rt.descriptor;
+            descriptor.graphicsFormat = GraphicsFormat.None;
+            descriptor.depthStencilFormat = GraphicsFormat.D32_SFloat_S8_UInt;
+            descriptor.useMipMap = false;
+            descriptor.autoGenerateMips = false;
+            descriptor.mipCount = 1;
+            descriptor.enableRandomWrite = false;
+            descriptor.memoryless = RenderTextureMemoryless.None;
+            descriptor.shadowSamplingMode = ShadowSamplingMode.None;
+            descriptor.bindMS = descriptor.msaaSamples > 1;
+            if (capturedDepth != null && descriptor.Equals(depthDescriptor)) return;
+            capturedDepth?.Release();
+            capturedDepth = RTHandles.Alloc(descriptor, FilterMode.Point,
+                TextureWrapMode.Clamp, name: "Recovered capture depth");
+            depthDescriptor = descriptor;
+        }
+
+        void Present(CustomPassContext ctx, RenderTexture final)
+        {
+            var destination = ctx.cameraColorBuffer;
+            var size = destination.useScaling
+                ? destination.GetScaledSize(destination.rtHandleProperties.currentViewportSize)
+                : new Vector2Int(destination.rt.width, destination.rt.height);
+            var format = destination.rt.graphicsFormat;
+            if (presentationColor == null || presentationColor.rt.width != size.x ||
+                presentationColor.rt.height != size.y || presentationColor.rt.graphicsFormat != format)
+            {
+                presentationColor?.Release();
+                presentationColor = RTHandles.Alloc(size.x, size.y, colorFormat: format,
+                    name: "Recovered presentation viewport");
+            }
+            // The legacy material expects _MainTex/vert_img. Draw it into a
+            // viewport-sized texture first, then use an RTHandle-aware copy
+            // so a larger pooled camera allocation does not crop the output.
+            ctx.cmd.Blit(final, presentationColor, source.finalCopyMaterial);
+            HDUtils.BlitCameraTexture(ctx.cmd, presentationColor, destination, 0, true);
+        }
 
         // Unity reverses the supplied clear depth on reversed-Z backends. The
         // manifest stores the captured native value, so undo that API conversion.
@@ -190,13 +264,7 @@ namespace OmniRenderDoc
             int width = ctx.hdCamera.actualWidth, height = ctx.hdCamera.actualHeight;
             if (source.isolatedDepth)
             {
-                if (capturedDepth == null || width != depthWidth || height != depthHeight)
-                {
-                    capturedDepth?.Release();
-                    capturedDepth = RTHandles.Alloc(width, height, format: GraphicsFormat.D32_SFloat_S8_UInt,
-                        name: "Recovered capture depth");
-                    depthWidth = width; depthHeight = height;
-                }
+                EnsureCapturedDepth(ctx.cameraColorBuffer);
                 CoreUtils.SetRenderTarget(ctx.cmd, ctx.cameraColorBuffer, capturedDepth);
                 ctx.cmd.ClearRenderTarget(true, source.clearColor, source.clearColorLinear,
                     UnityClearDepth(0));
@@ -243,7 +311,8 @@ namespace OmniRenderDoc
                 }
                 if (draw.cameraColorProperties.Count > 0)
                 {
-                    if (colorSnapshot == null || colorSnapshot.rt.width != width || colorSnapshot.rt.height != height)
+                    if (colorSnapshot == null || colorSnapshot.rt.width != width || colorSnapshot.rt.height != height ||
+                        colorSnapshot.rt.graphicsFormat != ctx.cameraColorBuffer.rt.graphicsFormat)
                     {
                         colorSnapshot?.Release();
                         colorSnapshot = RTHandles.Alloc(width, height, colorFormat: ctx.cameraColorBuffer.rt.graphicsFormat,
@@ -265,9 +334,17 @@ namespace OmniRenderDoc
                 {
                     var colors = new RenderTargetIdentifier[draw.colorTargets.Length];
                     for (int i = 0; i < colors.Length; i++) colors[i] = targets[draw.colorTargets[i]];
-                    RenderTargetIdentifier depth = string.IsNullOrEmpty(draw.depthTarget) ? BuiltinRenderTextureType.None : new RenderTargetIdentifier(targets[draw.depthTarget]);
-                    ctx.cmd.SetRenderTarget(colors, depth);
                     var first = targets[draw.colorTargets[0]];
+                    bool hasDepth = !string.IsNullOrEmpty(draw.depthTarget);
+                    if (!hasDepth && first.depthStencilFormat != GraphicsFormat.None)
+                        throw new InvalidOperationException("A color-only captured pass requires a color target without depth: " + draw.name);
+                    // Match CoreUtils.DrawFullScreen's no-depth MRT binding.
+                    // BuiltinRenderTextureType.None does not reliably unbind the
+                    // editor camera's depth; SceneView can then clip native draws
+                    // to that smaller attachment. A zero-depth color RT explicitly
+                    // supplies no depth surface, for both single and multiple MRTs.
+                    RenderTargetIdentifier depth = hasDepth ? targets[draw.depthTarget] : first;
+                    ctx.cmd.SetRenderTarget(colors, depth);
                     ctx.cmd.SetViewport(new Rect(0, 0, draw.viewportWidth > 0 ? draw.viewportWidth : first.width, draw.viewportHeight > 0 ? draw.viewportHeight : first.height));
                     draw.properties.SetVector("_CapturedScreenScale", new Vector4(1, 1, 0, 0));
                 }
@@ -284,6 +361,34 @@ namespace OmniRenderDoc
                     ctx.cmd.SetViewport(new Rect(0, 0, width, height));
                     draw.properties.SetVector("_CapturedScreenScale", scale);
                 }
+                Mesh renderMesh = draw.mesh;
+                Material renderMaterial = draw.material;
+                draw.properties.SetFloat("_CapturedEditEnabled", 0);
+                if (source.editableGeometry && draw.usesEditableObject)
+                {
+                    var editable = draw.editableObject;
+                    if (editable == null) continue;
+                    if (!editable.TryGetDraw(out renderMesh, out renderMaterial, out var objectToWorld)) continue;
+                    if (renderMesh.vertexCount != draw.mesh.vertexCount)
+                        throw new InvalidOperationException("Edited meshes must preserve captured vertex indices and vertex count: " + draw.name);
+                    var camera = ctx.hdCamera.camera;
+                    // Unity's CPU projection uses negative view Z and [-1,1]
+                    // depth. Convert its change into the capture's positive-Z,
+                    // [0,1] convention, retaining capture jitter/depth residuals.
+                    var depthConvention = Matrix4x4.identity;
+                    depthConvention.m22 = source.capturedProjection.m23 > 0 ? -0.5f : 0.5f;
+                    depthConvention.m23 = 0.5f;
+                    var viewConvention = Matrix4x4.Scale(new Vector3(1, 1, -1));
+                    var currentProjection = depthConvention * camera.projectionMatrix * viewConvention;
+                    var referenceProjection = depthConvention * source.capturedCameraProjection * viewConvention;
+                    var projection = source.capturedProjection;
+                    for (int element = 0; element < 16; element++)
+                        projection[element] += currentProjection[element] - referenceProjection[element];
+                    draw.properties.SetFloat("_CapturedEditEnabled", 1);
+                    draw.properties.SetMatrix("_CapturedEditObjectToClip", projection * camera.transform.worldToLocalMatrix * objectToWorld);
+                    draw.properties.SetMatrix("_CapturedReferenceObjectToClip", source.capturedProjection * editable.referenceLocalToWorld);
+                    editable.ApplyVaryingProperties(draw.properties, objectToWorld);
+                }
                 bool hasWrites = false;
                 foreach (var binding in draw.rawBuffers)
                 {
@@ -294,7 +399,7 @@ namespace OmniRenderDoc
                     ctx.cmd.SetRandomWriteTarget(binding.uavRegister, binding.gpuBuffer, true);
                     hasWrites = true;
                 }
-                ctx.cmd.DrawMesh(draw.mesh, Matrix4x4.identity, draw.material, 0, 0, draw.properties);
+                ctx.cmd.DrawMesh(renderMesh, Matrix4x4.identity, renderMaterial, 0, 0, draw.properties);
                 if (hasWrites) ctx.cmd.ClearRandomWriteTargets();
             }
             if (!string.IsNullOrEmpty(source.finalTarget))
@@ -303,13 +408,14 @@ namespace OmniRenderDoc
                 if (source.finalCopyMaterial == null) throw new InvalidOperationException("Missing final color transport material.");
                 source.finalCopyMaterial.SetFloat("_DecodeSRGB", source.finalIsSrgb ? 1 : 0);
                 source.finalCopyMaterial.SetFloat("_FlipY", source.finalFlipY ? 1 : 0);
-                ctx.cmd.Blit(final, ctx.cameraColorBuffer, source.finalCopyMaterial);
+                Present(ctx, final);
             }
         }
         protected override void Cleanup()
         {
             capturedDepth?.Release(); capturedDepth = null;
             colorSnapshot?.Release(); colorSnapshot = null;
+            presentationColor?.Release(); presentationColor = null;
             foreach (var target in targets.Values) { target.Release(); UnityEngine.Object.DestroyImmediate(target); }
             targets.Clear();
             source?.Release();
